@@ -1,104 +1,122 @@
+
+
+Claude · MD
 # CitySafe (Web)
-
-CitySafe is a community-powered neighborhood safety app. Residents report suspicious activity, vandalism, theft, and other safety concerns as pins on a live, shared map, and see what neighbors nearby have reported in real time.
-
-This is a **from-scratch React + TypeScript rewrite** of a prior Flutter app. It targets **web only** — no Android or iOS. It reuses the **existing Firebase project and Firestore data** (same collection, same schema, same live data) — this is a new frontend on an existing backend, not a new product.
-
-Read this whole file before writing code. It is the source of truth for scope, data shape, and conventions — don't infer them from scratch or from general React/Firebase habits.
-
+ 
+CitySafe is a civic safety app for Miyagi Prefecture. It visualizes official crime data — a weighted heatmap of theft incidents — and lets users request an AI-generated summary of crime patterns for a radius around any point on the map.
+ 
+This is a **from-scratch React + TypeScript rewrite** of a prior Flutter app, targeting **web only**. The app originally set out as a crowdsourced "residents report incidents" tool reusing the Flutter app's Firebase/Firestore backend — the `civic-data-ai-layer` milestone (https://github.com/gogogo-hash/citysafe-web/milestone/1) replaced that model entirely. Crowdsourced reporting is removed (not deprioritized), and crime data now comes from **official Miyagi Prefectural Police open data**, stored in **Postgres/PostGIS on Supabase**, not Firestore.
+ 
+Read this whole file before writing code. It is the source of truth for scope, data shape, and conventions — don't infer them from scratch, from general React/Firebase habits, or from memory of this app's earlier crowdsourced-reporting design.
+ 
 ## Tech stack (fixed — do not substitute)
-
+ 
 - **Build tool**: Vite, `react-ts` template
 - **Language**: TypeScript, strict mode. No `any` without a `// TODO` comment explaining why.
 - **Styling**: Tailwind CSS
-- **Components**: shadcn/ui (Radix primitives under the hood). Use shadcn components for dropdowns, form fields, buttons, and dialogs rather than hand-rolling them. Icons for UI chrome (not map markers) come from `lucide-react`, shadcn's default icon set.
-- **Data fetching/caching**: TanStack Query (`@tanstack/react-query`) wrapping a typed service layer — never call Firestore directly from a component.
-- **Routing**: React Router
-- **Maps**: `@vis.gl/react-google-maps` — this is Google's own maintained React library for the Maps JavaScript API, not a third-party wrapper. Do not use `@react-google-maps/api` or `google-maps-react`.
-- **Places search**: the current `google.maps.places.PlaceAutocompleteElement` (the "new" Place Autocomplete widget). Do **not** use `google.maps.places.Autocomplete` — that legacy widget is deprecated for new customers as of March 2025.
-- **Auth/DB**: Firebase JS SDK, modular v9+ API (`import { getAuth } from "firebase/auth"`, not the namespaced/compat SDK).
-- **Testing**: Vitest + React Testing Library for units/components; Playwright for e2e (added once core screens exist).
-
-## Data model — Firestore `reports` collection (already live, do not redesign)
-
-This schema exists today in the production Firestore project. Match it exactly — field names, types, and the collection name — so the new app reads and writes data compatible with what's already there.
-
-```ts
-interface Report {
-  id: string;             // Firestore document ID
-  lat: number;
-  lng: number;
-  category: IncidentCategory;
-  description: string;
-  createdBy: string;      // display name, or "anonymous"
-  createdAt: string;      // ISO 8601 string (not a Firestore Timestamp)
-}
-
-type IncidentCategory =
-  | "Suspicious Person"
-  | "Vandalism"
-  | "Theft"
-  | "Noise Complaint";
+- **Components**: shadcn/ui (Radix primitives). Icons for UI chrome come from `lucide-react`.
+- **Data fetching/caching**: TanStack Query (`@tanstack/react-query`) wrapping typed service layers — never call Firebase, Supabase, or the crime-data backend directly from a component.
+- **Routing**: React Router. GitHub Pages serves no server-side rewrites, so routing runs as `HashRouter` (or the `404.html` SPA-redirect trick) rather than `BrowserRouter` history mode — see Open Decisions, final call not yet made.
+- **Maps**: `@vis.gl/react-google-maps`, plus its `visualization` sub-library (`useMapsLibrary('visualization')`) for `google.maps.visualization.HeatmapLayer`. Do not use `@react-google-maps/api` or `google-maps-react`.
+- **Places search**: `google.maps.places.PlaceAutocompleteElement` if/when reintroduced. Never the legacy `Autocomplete` widget (deprecated for new customers since March 2025).
+- **Auth**: Firebase Auth (JS SDK, modular v9+) — Google, Apple, and anonymous sign-in. Unaffected by the data-layer changes below.
+- **Crime data storage**: Postgres + PostGIS on **Supabase** (chosen over Cloud SQL for free-tier cost — 500MB DB / 50K MAU comfortably covers current scale). Any client-side reads go through `@supabase/supabase-js` with the anon key, gated by Row Level Security. The service-role key is never shipped to the browser — it lives only in Cloud Run deploy secrets.
+- **Crime-data backend**: two small services on **Google Cloud Run** — `crime-data-api` (radius/aggregation queries) and `generateAreaSummary` (the AI-summary service). See "Backend services" below.
+- **Hosting**: **GitHub Pages** via GitHub Actions (not Firebase Hosting — see Non-goals). Repo is public, so this runs on the free tier.
+- **Testing**: Vitest + React Testing Library for units/components; Playwright for e2e.
+## Data model
+ 
+### `crime_incidents` (Postgres/PostGIS on Supabase — source of truth for crime data)
+ 
+```sql
+crime_incidents
+  id            bigint / uuid primary key
+  category      text        -- one of 7 Miyagi theft categories (see below)
+  occurred_on   date
+  year          integer     -- derived from occurred_on, used for weight decay
+  municipality  text
+  town_chome    text
+  geog          geography(Point, 4326)   -- spatial index required
+  weight        numeric     -- set by the ingestion pipeline (year-decay, ~0.85/year, most recent year = 1.0)
+  source        text        -- data traceability
 ```
-
-Note `createdAt` is stored as an ISO string, not a Firestore `Timestamp` — the old app wrote it that way and existing documents are in that format, so keep writing/reading it as a string.
-
-### Category → marker icon mapping
-
-Each category has a fixed marker icon (assets provided separately, place under `src/assets/icons/`):
-
-| Category | Icon file |
-|---|---|
-| Suspicious Person | `suspiciousperson.png` |
-| Vandalism | `vandalism.png` |
-| Theft | `theft.png` |
-| Noise Complaint | `noisecomplaint.png` |
-
-## V1 scope (feature parity — nothing more)
-
-Build exactly these, and no further-out roadmap features yet:
-
-1. **Auth**: sign in with Google, or continue anonymously (Firebase Auth). An auth gate shows the sign-in screen when signed out and the main app when signed in.
-2. **Map screen**: full-screen Google Map (roadmap view for now — switched from hybrid to rule out satellite-tile weight while diagnosing slow tile loading on a slow connection; revisit hybrid once that's resolved). On load, center on the user's current location (browser Geolocation API, with a sensible fallback/error state if permission is denied). Tapping the map drops a temporary pin. A collapsible search bar (Place Autocomplete) can also recenter the map. Markers for existing reports load for the current visible bounds and reload when the camera stops moving (pan/zoom idle) — this is a bounding-box query against Firestore (`lat`/`lng` between the visible region's SW/NE corners), not a full-collection fetch. Each marker shows its category and description in an info window/popup.
-3. **Add Incident screen**: a form with a category dropdown (the 4 fixed categories) and a description field, pre-filled with the location pinned on the map screen. Submitting writes a new `reports` document to Firestore and returns to the map.
-4. **Firestore service layer**: a typed `reportsService` (get-in-bounds, create) that all components go through — this was explicitly missing in the old app and should be done right from the start here, not retrofitted.
-5. **Nav**: a bottom nav bar with a single Map tab (this is a mobile-first web app, used mostly on phones in-browser). Add Incident is not a persistent tab — it's reached only via the "Report Incident Here" button that appears on the map after dropping a pin.
-
-### Explicitly out of scope for v1 (don't build yet, don't design around them either)
-
-- Sign in with Apple — never actually set up in the old Flutter app either, and requires a $99/yr Apple Developer Program membership. Not worth it for this project; revisit only if that changes.
-- Photo attachments on reports
-- Incident detail/edit view
-- Offline support
-- Any native mobile shell (no Capacitor/PWA wrapper, etc.) — plain responsive web
-
+ 
+Categories (Miyagi Police theft data): snatching, vehicle theft, parts theft, vending-machine theft, car theft, motorcycle theft, bicycle theft.
+ 
+**Hard rule: victim demographics (age, occupation, etc.) are excluded at ingestion and must never appear in this table, in API responses, or in AI-summary prompts.** Raw incident rows also never leave the `crime-data-api` service — every consumer (heatmap, AI summary) works from aggregates or a pre-built static file, never row-level queries from the client.
+ 
+Writes to `crime_incidents` come only from the ingestion pipeline (server-side, service-role key). The client never writes to this table.
+ 
+### Heatmap static file
+ 
+The ingestion pipeline emits a static GeoJSON `FeatureCollection` of weighted points as a build artifact, fetched once per session by `useHeatmapData()` — not a live query. Exact filename/path and how it's bundled into the GitHub Pages build are decided alongside the ingestion pipeline and deploy workflow.
+ 
+### Firestore `reports` (legacy — do not use)
+ 
+The original Firebase project's `reports` collection (the crowdsourced-incident schema this app used to read/write) is **abandoned in place**: not migrated, not deleted, not read, not written. It's documented here only so nobody reintroduces it by habit. Firebase Auth (a separate product from Firestore) is still in active use.
+ 
+## V1 scope for this phase (`civic-data-ai-layer` milestone)
+ 
+1. **Auth**: unchanged — Google / Apple / anonymous sign-in via Firebase Auth, gating the app.
+2. **Map screen — heatmap**: full-screen Google Map rendering a weighted heatmap of `crime_incidents` (via the static GeoJSON file, not a live query), binned into grid cells when zoomed out and finer/individual points when zoomed in. A chōme-level choropleth is an open alternative worth evaluating, not yet decided (see Open Decisions).
+3. **Pin-drop + radius-select**: click the map to drop a pin (same interaction pattern as the old, now-removed Add Incident flow), pick a radius from presets (500m / 1km / 2km — exact default TBD), then a single trigger button requests an AI summary for that area. UI shell only — it never creates a record.
+4. **AI area summary**: the trigger calls `crime-data-api` for aggregated, radius-windowed counts by category (plus the prior period, for trend), which `generateAreaSummary` turns into an LLM-written summary. Loading and error states are required. The summary must:
+   - be built only from aggregated counts/trends — never raw incident rows, never demographic data
+   - use a neutral tone with no speculation
+   - explicitly state its scope (radius, time window)
+   - include a category breakdown
+   - read unambiguously as **CitySafe's** output, never implied to be produced by Miyagi Police
+5. **Data attribution (hard requirement, not polish)**: wherever police-derived data or its derivatives are shown (heatmap, AI summaries), display **"宮城県警察ウェブサイト"** (Miyagi Prefectural Police website) plus the source URL (https://www.police.pref.miyagi.jp/seian/opendata.html), and a note that CitySafe has processed/edited the data. Full license terms: https://www.police.pref.miyagi.jp/seian/pdf/riyoukiyaku.pdf.
+6. **Nav**: bottom nav bar. The Add Incident tab is gone. A persistent affordance for the AI-summary flow is deferred until the flow actually needs one — it's currently triggered contextually from the map, not from nav.
+### Explicitly out of scope
+ 
+- Crowdsourced incident reporting / Add Incident — **removed entirely, not deprioritized.** The Firestore `reports` collection is abandoned in place (see Data model).
+- Photo attachments, incident detail/edit view, offline support, any native mobile shell — unchanged from before.
+- Raw incident rows or victim demographics ever reaching the client, or appearing in an LLM prompt.
+- Live bounds-based crime queries against Postgres — the heatmap uses a static per-session file at current (Miyagi-only) scale. Bounds-based `onCameraIdle` queries against PostGIS are a documented future-scaling path, not v1.
+- Caching/memoization of AI summaries — explicitly deferred past v1.
+## Backend services (Cloud Run)
+ 
+Two services, both calling Supabase Postgres with the **service-role key, server-side only**:
+ 
+- **`crime-data-api`**: given a lat/lng and radius, returns aggregated counts by category and time window (PostGIS `ST_DWithin` + `GROUP BY`/`COUNT`), including the prior period of the same length for trend comparison. Never returns raw rows.
+- **`generateAreaSummary`**: calls `crime-data-api`, builds an LLM prompt from the aggregates only, and returns the summary text described above. LLM provider/model, exact hosting (Cloud Run vs. Cloud Function), client-invocation shape, required secrets, and caching are **not yet decided** — see Open Decisions.
+Whether these services live in this repo (e.g. a `/services/` directory) or a separate backend repo is also undecided — don't assume a location until it's settled.
+ 
 ## Project conventions
-
+ 
 ```
 src/
   app/                  # routes, layout, nav shell
-  auth/                 # AuthContext, sign-in page, auth gate
-  map/                  # map screen, marker rendering, bounds-based query hook
-  incidents/            # add-incident form
-  components/ui/        # shadcn-generated components live here
+  auth/                 # AuthContext, sign-in page, auth gate (unchanged)
+  map/
+    HeatmapLayer.tsx          # renders google.maps.visualization.HeatmapLayer
+    useHeatmapData.ts         # fetches + caches the static GeoJSON file, once per session
+    PinDropRadiusSelect.tsx   # pin-drop + radius-preset picker + trigger button
+  ai-summary/
+    useAreaSummary.ts     # TanStack Query hook wrapping the generateAreaSummary endpoint
+    SummaryPanel.tsx       # loading/error/result display, with CitySafe + police attribution
+  attribution/
+    DataAttribution.tsx    # shared "宮城県警察ウェブサイト" + processing-disclaimer component
+  components/ui/         # shadcn-generated components
   services/
-    firebase.ts         # SDK init (reads from env)
-    reportsService.ts   # typed Firestore access for `reports`
-    authService.ts
+    firebase.ts            # Firebase init — exports `auth` only (Firestore no longer used)
+    supabase.ts             # Supabase client init (anon key, RLS-gated), if/when the client reads directly
+    crimeDataApi.ts          # typed fetch wrapper for the crime-data-api Cloud Run service
+    aiSummaryApi.ts           # typed fetch wrapper for generateAreaSummary
   types/
-    report.ts           # Report / IncidentCategory types above
-  assets/
-    icons/               # category marker PNGs
+    crimeIncident.ts         # crime_incidents row shape, category union
 ```
-
-- Components go through hooks (e.g. `useReportsInBounds(bounds)`, `useCreateReport()`) built on TanStack Query wrapping the service layer — never call `firebase/firestore` functions directly inside a component.
-- Auth state is exposed via a `useAuth()` hook backed by a Context provider that subscribes to `onAuthStateChanged` once, at the app root.
-- Keep files small and colocated by feature (the folders above), not by type (no global `components/`, `hooks/`, `utils/` dumping grounds beyond `components/ui/` for shadcn).
-
+ 
+Removed from the old structure (deleted when Add Incident was removed, superseded by the heatmap): `src/incidents/`, `src/map/useReportsInBounds.ts`, `src/map/ReportMarker.tsx`, `src/map/categoryIcons.ts`, the four category marker PNGs under `src/assets/icons/`, and `reportsService.ts`'s Firestore read/write paths.
+ 
+- Components go through hooks (`useHeatmapData()`, `useAreaSummary(...)`) built on TanStack Query wrapping the service layer — never call Supabase, Firebase, or `fetch` directly inside a component.
+- Auth state still goes through `useAuth()` backed by a Context provider at the app root — unchanged.
+- Keep files small and colocated by feature; no global `hooks/`/`utils/` dumping grounds beyond `components/ui/` for shadcn.
 ## Environment variables
-
-Create a `.env.example` (committed) documenting these; real values go in a gitignored `.env`:
-
+ 
+`.env.example` (committed; real values in a gitignored `.env`):
+ 
 ```
 VITE_FIREBASE_API_KEY=
 VITE_FIREBASE_AUTH_DOMAIN=
@@ -107,13 +125,30 @@ VITE_FIREBASE_STORAGE_BUCKET=
 VITE_FIREBASE_MESSAGING_SENDER_ID=
 VITE_FIREBASE_APP_ID=
 VITE_GOOGLE_MAPS_API_KEY=
+VITE_SUPABASE_URL=
+VITE_SUPABASE_ANON_KEY=
 ```
-
-Real values come from the Firebase console (same project the old Flutter app uses) and the existing Google Maps API key — never invent placeholder values that look like real keys.
-
+ 
+Never invent placeholder values that look like real keys. Once the crime-data backend lands, this file also needs base URLs for the two Cloud Run services (e.g. `VITE_CRIME_API_BASE_URL`, `VITE_AI_SUMMARY_API_BASE_URL` — exact names TBD). The Supabase **service-role** key never appears here or anywhere client-side — it's a Cloud Run deploy secret only.
+ 
+**Security note**: once deployed to GitHub Pages, `VITE_GOOGLE_MAPS_API_KEY` is publicly visible in the built bundle — it must have HTTP referrer restrictions set in Google Cloud Console. The Supabase anon key doesn't need equivalent protection as long as Row Level Security is correctly configured.
+ 
+## Open decisions
+ 
+Flagged, not resolved — don't silently pick one while implementing an unrelated piece of work:
+ 
+- **SPA routing on GitHub Pages**: `HashRouter` vs. the `404.html` redirect trick. `HashRouter` is the simpler default; final call TBD.
+- **Backend repo layout**: Cloud Run services in this repo vs. a separate backend repo.
+- **`generateAreaSummary` internals**: LLM provider/model, Cloud Run vs. Cloud Function hosting, client-invocation shape, required secrets.
+- **Radius-picker default** among the 500m/1km/2km presets.
+- **Heatmap vs. chōme-level choropleth** as the primary crime-density visualization.
 ## Non-goals
-
+ 
 - No Android/iOS build targets.
-- No new Firebase project — this app reads/writes the same `reports` collection the Flutter app used.
+- No new Firebase project, and no further reads/writes to the Firestore `reports` collection — abandoned in place, not migrated.
+- No Firebase Hosting — this app deploys to GitHub Pages.
+- No raw `crime_incidents` rows or victim demographic data reaching the client or an LLM prompt — aggregates only, enforced at the `crime-data-api` boundary.
 - No state management library beyond React Context + TanStack Query at this size (no Redux/Zustand) unless a future feature genuinely needs it.
-- No Next.js / SSR — this is a client-only SPA deployed as static files to Firebase Hosting.
+- No Next.js / SSR — this is a client-only SPA deployed as static files.
+ 
+
